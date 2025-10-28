@@ -2,18 +2,17 @@
 Helpers for Evaluations
 """
 
-import requests
-import torch
-import torch.nn as nn
-import os, subprocess
-from pydantic import BaseModel
-import numpy as np
-import random
 import json
+import os
+import subprocess
+import sys
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
-import sys
-import os
+
+import numpy as np
+import torch
+import torch.nn as nn
+from pydantic import BaseModel
 
 # Fix import path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,12 +29,13 @@ KERNEL_BENCH_PATH = os.path.join(REPO_TOP_PATH, "KernelBench")
 
 
 def fetch_kernel_from_database(
-    run_name: str, problem_id: int, sample_id: int, server_url: str
+        run_name: str, problem_id: int, sample_id: int, server_url: str
 ):
     """
     Intenral to us with our django database
     Return a dict with kernel hash, kernel code, problem_id
     """
+    import requests
     response = requests.get(
         f"{server_url}/get_kernel_by_run_problem_sample/{run_name}/{problem_id}/{sample_id}",
         json={"run_name": run_name, "problem_id": problem_id, "sample_id": sample_id},
@@ -91,7 +91,7 @@ class KernelExecResult(BaseModel):
 
 
 def load_original_model_and_inputs(
-    model_original_src: str, context: dict
+        model_original_src: str, context: dict
 ) -> tuple[nn.Module, callable, callable]:
     """
     Load class from original NN.module pytorch code
@@ -136,13 +136,13 @@ def detect_triton_kernel(model_src: str) -> bool:
 def _cleanup_triton_cache():
     """Helper function to cleanup Triton cache"""
     import shutil
-    
+
     # Triton cache locations
     triton_cache_paths = [
         os.path.join(os.path.expanduser("~"), ".triton", "cache"),
         "/tmp/triton"  # Alternative cache location
     ]
-    
+
     for cache_path in triton_cache_paths:
         if os.path.exists(cache_path):
             try:
@@ -153,7 +153,7 @@ def _cleanup_triton_cache():
 
 
 def load_custom_model(
-    model_custom_src: str, context: dict, build_directory: str = None
+        model_custom_src: str, context: dict, build_directory: str = None
 ) -> nn.Module:
     """
     Load class from custom NN.module pytorch code
@@ -163,8 +163,8 @@ def load_custom_model(
         context["BUILD_DIRECTORY"] = build_directory
         # Add import at the start of the source code
         model_custom_src = (
-            "import os\n" f"os.environ['TORCH_EXTENSIONS_DIR'] = '{build_directory}'\n"
-        ) + model_custom_src
+                               "import os\n" f"os.environ['TORCH_EXTENSIONS_DIR'] = '{build_directory}'\n"
+                           ) + model_custom_src
 
     try:
         compile(model_custom_src, "<string>", "exec")
@@ -179,7 +179,7 @@ def load_custom_model(
 
 
 def load_custom_model_triton(
-    model_custom_src: str, context: dict, build_directory: str = None
+        model_custom_src: str, context: dict, build_directory: str = None
 ) -> nn.Module:
     """
     Load class from custom NN.module pytorch code with Triton kernels
@@ -192,7 +192,7 @@ def load_custom_model_triton(
     import importlib.util
     import sys
     import hashlib
-    
+
     # Set build directory and environment variables (matching CUDA behavior)
     if build_directory:
         context["BUILD_DIRECTORY"] = build_directory
@@ -200,15 +200,15 @@ def load_custom_model_triton(
         triton_cache_dir = os.path.join(build_directory, "triton_cache")
         os.makedirs(triton_cache_dir, exist_ok=True)
         os.environ["TRITON_CACHE_DIR"] = triton_cache_dir
-        
+
         # Use build directory for the temporary module (like CUDA uses TORCH_EXTENSIONS_DIR)
         temp_dir = build_directory
-        
+
         # Add environment setup to source code (matching CUDA pattern)
         model_custom_src = (
-            "import os\n"
-            f"os.environ['TRITON_CACHE_DIR'] = '{triton_cache_dir}'\n"
-        ) + model_custom_src
+                               "import os\n"
+                               f"os.environ['TRITON_CACHE_DIR'] = '{triton_cache_dir}'\n"
+                           ) + model_custom_src
     else:
         # Use system temp directory
         temp_dir = tempfile.gettempdir()
@@ -216,15 +216,15 @@ def load_custom_model_triton(
     try:
         # First, verify the code compiles (matching CUDA behavior)
         compile(model_custom_src, "<string>", "exec")
-        
+
         # Create a hash-based filename to avoid conflicts (like CUDA kernel hashing)
         code_hash = hashlib.md5(model_custom_src.encode()).hexdigest()
         module_filename = f"triton_kernel_{code_hash}.py"
         module_path = os.path.join(temp_dir, module_filename)
-        
+
         # Ensure the directory exists
         os.makedirs(temp_dir, exist_ok=True)
-        
+
         # Write the source code to a persistent file
         try:
             with open(module_path, 'w', encoding='utf-8') as f:
@@ -234,39 +234,39 @@ def load_custom_model_triton(
             if "lock" in str(e).lower() or "permission" in str(e).lower():
                 raise RuntimeError(f"File lock or permission error: {e}")
             raise e
-        
+
         module_name = f"triton_kernel_module_{code_hash}"
-        
+
         try:
             # Import the module from the file
             spec = importlib.util.spec_from_file_location(module_name, module_path)
             if spec is None or spec.loader is None:
                 raise ImportError(f"Could not create module spec for {module_path}")
-                
+
             module = importlib.util.module_from_spec(spec)
-            
+
             # Add to sys.modules to make it findable by inspect (before execution)
             sys.modules[module_name] = module
-            
+
             # Store cleanup info in context (before execution in case it fails)
             context["_triton_module_path"] = module_path
             context["_triton_module_name"] = module_name
-            
+
             # Execute the module
             spec.loader.exec_module(module)
-            
+
             # Extract ModelNew from the module (matching CUDA error handling)
             ModelNew = getattr(module, "ModelNew", None)
             if ModelNew is None:
                 raise AttributeError("ModelNew class not found in Triton kernel code")
-                
+
             # Update context with all module attributes for compatibility
             for attr_name in dir(module):
                 if not attr_name.startswith('_'):
                     context[attr_name] = getattr(module, attr_name)
-            
+
             return ModelNew
-            
+
         except Exception as e:
             # Clean up on error (more comprehensive like CUDA)
             cleanup_error = None
@@ -275,21 +275,21 @@ def load_custom_model_triton(
                     del sys.modules[module_name]
             except Exception as cleanup_e:
                 cleanup_error = cleanup_e
-                
+
             try:
                 if os.path.exists(module_path):
                     os.unlink(module_path)
             except Exception as cleanup_e:
                 if cleanup_error is None:
                     cleanup_error = cleanup_e
-            
+
             # Remove from context if we added it
             context.pop("_triton_module_path", None)
             context.pop("_triton_module_name", None)
-            
+
             # Re-raise original error (not cleanup error)
             raise e
-                
+
     except SyntaxError as e:
         print(f"Syntax Error in Triton kernel code or Compilation Error {e}")
         return None
@@ -333,9 +333,9 @@ def graceful_eval_cleanup(curr_context: dict, device: torch.device):
 
 
 def build_compile_cache_triton(
-    custom_model_src: str,
-    verbose: bool = False,
-    build_dir: os.PathLike = None,
+        custom_model_src: str,
+        verbose: bool = False,
+        build_dir: os.PathLike = None,
 ) -> tuple[bool, str, str]:
     """
     Pre-warm Triton kernels by doing a test compilation
@@ -356,7 +356,7 @@ def build_compile_cache_triton(
     try:
         # Set Triton environment variables (equivalent to CUDA's TORCH_USE_CUDA_DSA)
         os.environ["TRITON_PRINT_AUTOTUNING"] = "0"  # reduce noise during compilation
-        
+
         # Set Triton cache directory if build_dir is provided
         if build_dir:
             triton_cache_dir = os.path.join(build_dir, "triton_cache")
@@ -366,7 +366,7 @@ def build_compile_cache_triton(
         # Capture stdout during compilation (matching CUDA pattern)
         with redirect_stdout(stdout_buffer), redirect_stderr(stdout_buffer):
             ModelNew = load_custom_model_triton(custom_model_src, context, build_dir)
-            
+
             # Try to instantiate to trigger any immediate compilation errors
             if ModelNew:
                 try:
@@ -384,7 +384,7 @@ def build_compile_cache_triton(
 
         if verbose:
             print(f"[Compilation] Triton kernel pre-warming successful, saved cache at: {build_dir}")
-            
+
     except Exception as e:
         error_msg = f"Failed to compile Triton kernel. Unable to cache, \nError: {e}"
         print(f"[Compilation] {error_msg}")
@@ -394,9 +394,9 @@ def build_compile_cache_triton(
 
 
 def build_compile_cache_auto(
-    custom_model_src: str,
-    verbose: bool = False,
-    build_dir: os.PathLike = None,
+        custom_model_src: str,
+        verbose: bool = False,
+        build_dir: os.PathLike = None,
 ) -> tuple[bool, str, str]:
     """
     Auto-detect kernel type and use appropriate build cache function
@@ -412,9 +412,9 @@ def build_compile_cache_auto(
 
 
 def build_compile_cache_legacy(
-    custom_model_src: str,
-    verbose: bool = False,
-    build_dir: os.PathLike = None,
+        custom_model_src: str,
+        verbose: bool = False,
+        build_dir: os.PathLike = None,
 ) -> tuple[bool, str, str]:
     """
     Try to build the compiled cuda code for sample and store in the cache directory
@@ -446,14 +446,14 @@ def build_compile_cache_legacy(
     except Exception as e:
         print(f"[Compilation] Failed to compile custom CUDA kernel. Unable to cache, \nError: {e}")
         return False, stdout_buffer.getvalue(), str(e)
-    
+
     return True, stdout_buffer.getvalue(), None
 
 
 def build_compile_cache(
-    custom_model_src: str,
-    verbose: bool = False,
-    build_dir: os.PathLike = None,
+        custom_model_src: str,
+        verbose: bool = False,
+        build_dir: os.PathLike = None,
 ) -> tuple[bool, str, str]:
     """
     Try to build the compiled cuda code for sample and store in the cache directory
@@ -490,9 +490,9 @@ def build_compile_cache(
 
 
 def build_compile_cache_with_capturing(
-    custom_model_src: str,
-    verbose: bool = False,
-    build_dir: os.PathLike = None
+        custom_model_src: str,
+        verbose: bool = False,
+        build_dir: os.PathLike = None
 ) -> tuple[int, str, str]:
     """
     Write a temporary python file to compile the custom model on CPU
@@ -502,8 +502,8 @@ def build_compile_cache_with_capturing(
     if build_dir:
         # Add import at the start of the source code
         custom_model_src = (
-            "import os\n" f"os.environ['TORCH_EXTENSIONS_DIR'] = '{build_dir}'\n"
-        ) + custom_model_src
+                               "import os\n" f"os.environ['TORCH_EXTENSIONS_DIR'] = '{build_dir}'\n"
+                           ) + custom_model_src
 
     kernel_hash = hash(custom_model_src)
     # tmp is a temp python file we write to for compilation
@@ -521,25 +521,24 @@ def build_compile_cache_with_capturing(
     # Clean up temporary file
     os.remove(tmp)
 
-
     if verbose:
         print("[CPU Precompile] return code: ", returncode)
         print("[CPU Precompile] stdout: \n", stdout.decode('utf-8'))
-        print("[CPU Precompile] stderr: \n", stderr.decode('utf-8')) 
+        print("[CPU Precompile] stderr: \n", stderr.decode('utf-8'))
 
     return returncode, stdout.decode('utf-8'), stderr.decode('utf-8')
 
 
 def eval_kernel_against_ref(
-    original_model_src: str,
-    custom_model_src: str,
-    seed_num: int = 42,
-    num_correct_trials: int = 1,
-    num_perf_trials: int = 10,
-    verbose: bool = False,
-    measure_performance: bool = False,
-    build_dir: os.PathLike = None,
-    device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None, # have to run on GPU
+        original_model_src: str,
+        custom_model_src: str,
+        seed_num: int = 42,
+        num_correct_trials: int = 1,
+        num_perf_trials: int = 10,
+        verbose: bool = False,
+        measure_performance: bool = False,
+        build_dir: os.PathLike = None,
+        device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None,  # have to run on GPU
 ) -> KernelExecResult:
     """
     Evaluate the custom kernel against the original model
@@ -550,11 +549,11 @@ def eval_kernel_against_ref(
     """
     # Check device availability and status
     assert torch.cuda.is_available(), "CUDA is not available, cannot run Eval"
-    
+
     # Verify device is valid
     if device.type != 'cuda':
         raise ValueError(f"Device must be CUDA device, got {device}")
-    
+
     # Check if device is accessible
     try:
         torch.cuda.set_device(device)
@@ -612,7 +611,7 @@ def eval_kernel_against_ref(
         # Categorize and add detailed metadata for compilation errors
         error_str = str(e)
         metadata["compilation_error"] = error_str
-        
+
         # Categorize error types for better debugging
         if "lock" in error_str.lower() or "no such file or directory" in error_str.lower():
             metadata["error_category"] = "file_system_error"
@@ -633,7 +632,7 @@ def eval_kernel_against_ref(
             metadata["error_category"] = "import_error"
         else:
             metadata["error_category"] = "unknown_compilation_error"
-            
+
         graceful_eval_cleanup(context, device)
         return KernelExecResult(
             compiled=False, metadata=metadata
@@ -655,7 +654,7 @@ def eval_kernel_against_ref(
         # Categorize and add detailed metadata for runtime errors
         error_str = str(e)
         metadata["runtime_error"] = error_str
-        
+
         # Categorize runtime error types for better debugging
         if "cuda" in error_str.lower():
             if "illegal memory access" in error_str.lower():
@@ -672,7 +671,7 @@ def eval_kernel_against_ref(
             metadata["error_category"] = "tensor_dimension_error"
         else:
             metadata["error_category"] = "unknown_runtime_error"
-            
+
         graceful_eval_cleanup(context, device)
         return KernelExecResult(
             compiled=True, correctness=False, metadata=metadata
@@ -698,7 +697,7 @@ def eval_kernel_against_ref(
         # Categorize and add detailed metadata for correctness check errors
         error_str = str(e)
         metadata["runtime_error"] = error_str
-        
+
         # Categorize error types during correctness checking
         if "cuda" in error_str.lower():
             if "illegal memory access" in error_str.lower():
@@ -713,7 +712,7 @@ def eval_kernel_against_ref(
             metadata["error_category"] = "tensor_dimension_error"
         else:
             metadata["error_category"] = "correctness_check_error"
-            
+
         kernel_exec_result = KernelExecResult(
             compiled=True, correctness=False, metadata=metadata
         )
@@ -769,7 +768,7 @@ def graceful_eval_cleanup_triton(curr_context: dict, device: torch.device):
                 os.unlink(module_path)
         except Exception:
             pass  # Ignore cleanup errors
-    
+
     if "_triton_module_name" in curr_context:
         try:
             import sys
@@ -778,7 +777,7 @@ def graceful_eval_cleanup_triton(curr_context: dict, device: torch.device):
                 del sys.modules[module_name]
         except Exception:
             pass  # Ignore cleanup errors
-    
+
     del curr_context
     # Clear CUDA cache and reset GPU state
     with torch.cuda.device(device):
@@ -791,15 +790,15 @@ def graceful_eval_cleanup_triton(curr_context: dict, device: torch.device):
 
 
 def eval_triton_kernel_against_ref(
-    original_model_src: str,
-    custom_model_src: str,
-    seed_num: int = 42,
-    num_correct_trials: int = 1,
-    num_perf_trials: int = 10,
-    verbose: bool = False,
-    measure_performance: bool = False,
-    build_dir: os.PathLike = None,
-    device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None,
+        original_model_src: str,
+        custom_model_src: str,
+        seed_num: int = 42,
+        num_correct_trials: int = 1,
+        num_perf_trials: int = 10,
+        verbose: bool = False,
+        measure_performance: bool = False,
+        build_dir: os.PathLike = None,
+        device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None,
 ) -> KernelExecResult:
     """
     Evaluate Triton kernel against the original model
@@ -811,11 +810,11 @@ def eval_triton_kernel_against_ref(
     """
     # Check device availability and status
     assert torch.cuda.is_available(), "CUDA is not available, cannot run Triton kernels"
-    
+
     # Verify device is valid
-    if device.type != 'cuda':
+    if not torch.cuda.is_available():
         raise ValueError(f"Device must be CUDA device, got {device}")
-    
+
     # Check if device is accessible
     try:
         torch.cuda.set_device(device)
@@ -875,7 +874,7 @@ def eval_triton_kernel_against_ref(
         # Categorize and add detailed metadata for compilation errors (Triton-specific)
         error_str = str(e)
         metadata["compilation_error"] = error_str
-        
+
         # Categorize error types for better debugging
         if "lock" in error_str.lower() or "no such file or directory" in error_str.lower():
             metadata["error_category"] = "file_system_error"
@@ -903,7 +902,7 @@ def eval_triton_kernel_against_ref(
             metadata["error_category"] = "triton_source_inspection_error"
         else:
             metadata["error_category"] = "unknown_compilation_error"
-            
+
         graceful_eval_cleanup_triton(context, device)
         return KernelExecResult(
             compiled=False, metadata=metadata
@@ -925,7 +924,7 @@ def eval_triton_kernel_against_ref(
         # Categorize and add detailed metadata for runtime errors
         error_str = str(e)
         metadata["runtime_error"] = error_str
-        
+
         # Categorize runtime error types for better debugging (Triton-specific)
         if "triton" in error_str.lower():
             if "compilation" in error_str.lower():
@@ -951,7 +950,7 @@ def eval_triton_kernel_against_ref(
             metadata["error_category"] = "triton_source_inspection_error"
         else:
             metadata["error_category"] = "unknown_runtime_error"
-            
+
         graceful_eval_cleanup_triton(context, device)
         return KernelExecResult(
             compiled=True, correctness=False, metadata=metadata
@@ -977,7 +976,7 @@ def eval_triton_kernel_against_ref(
         # Categorize and add detailed metadata for correctness check errors (Triton-specific)
         error_str = str(e)
         metadata["runtime_error"] = error_str
-        
+
         # Categorize error types during correctness checking
         if "triton" in error_str.lower():
             if "compilation" in error_str.lower():
@@ -1001,7 +1000,7 @@ def eval_triton_kernel_against_ref(
             metadata["error_category"] = "triton_source_inspection_error"
         else:
             metadata["error_category"] = "correctness_check_error"
-            
+
         kernel_exec_result = KernelExecResult(
             compiled=True, correctness=False, metadata=metadata
         )
@@ -1046,15 +1045,15 @@ def eval_triton_kernel_against_ref(
 
 
 def eval_kernel_against_ref_auto(
-    original_model_src: str,
-    custom_model_src: str,
-    seed_num: int = 42,
-    num_correct_trials: int = 1,
-    num_perf_trials: int = 10,
-    verbose: bool = False,
-    measure_performance: bool = False,
-    build_dir: os.PathLike = None,
-    device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None,
+        original_model_src: str,
+        custom_model_src: str,
+        seed_num: int = 42,
+        num_correct_trials: int = 1,
+        num_perf_trials: int = 10,
+        verbose: bool = False,
+        measure_performance: bool = False,
+        build_dir: os.PathLike = None,
+        device: torch.device = torch.cuda.current_device() if torch.cuda.is_available() else None,
 ) -> KernelExecResult:
     """
     Automatically detect kernel type and use appropriate evaluation function
@@ -1090,12 +1089,12 @@ def eval_kernel_against_ref_auto(
 
 
 def register_and_format_exception(
-    exception_type: str,
-    exception_msg: Exception | str,
-    metadata: dict,
-    verbose: bool = False,
-    truncate=False,
-    max_length=200,
+        exception_type: str,
+        exception_msg: Exception | str,
+        metadata: dict,
+        verbose: bool = False,
+        truncate=False,
+        max_length=200,
 ):
     """
     max_length characters
@@ -1115,12 +1114,12 @@ def register_and_format_exception(
 
 
 def time_execution_with_cuda_event(
-    kernel_fn: callable,
-    *args,
-    num_warmup: int = 3,
-    num_trials: int = 10,
-    verbose: bool = True,
-    device: torch.device = None,
+        kernel_fn: callable,
+        *args,
+        num_warmup: int = 3,
+        num_trials: int = 10,
+        verbose: bool = True,
+        device: torch.device = None,
 ) -> list[float]:
     """
     Time a CUDA kernel function over multiple trials using torch.cuda.Event
@@ -1173,14 +1172,14 @@ def time_execution_with_cuda_event(
 
 
 def run_and_check_correctness(
-    original_model_instance: nn.Module,
-    new_model_instance: nn.Module,
-    get_inputs_fn: callable,
-    metadata: dict,
-    num_correct_trials: int,
-    verbose=False,
-    seed=42,
-    device=None,
+        original_model_instance: nn.Module,
+        new_model_instance: nn.Module,
+        get_inputs_fn: callable,
+        metadata: dict,
+        num_correct_trials: int,
+        verbose=False,
+        seed=42,
+        device=None,
 ) -> KernelExecResult:
     """
     run the model and check correctness,
@@ -1194,7 +1193,7 @@ def run_and_check_correctness(
     # Generate num_correct_trials seeds deterministically from the initial seed
     torch.manual_seed(seed)
     correctness_trial_seeds = [
-        torch.randint(0, 2**32 - 1, (1,)).item() for _ in range(num_correct_trials)
+        torch.randint(0, 2 ** 32 - 1, (1,)).item() for _ in range(num_correct_trials)
     ]
 
     with torch.no_grad():
@@ -1241,7 +1240,7 @@ def run_and_check_correctness(
 
                 # check output value difference
                 if not torch.allclose(
-                    output, output_new, atol=1e-02, rtol=1e-02
+                        output, output_new, atol=1e-02, rtol=1e-02
                 ):  # fail
                     max_diff = torch.max(torch.abs(output - output_new)).item()
                     avg_diff = torch.mean(torch.abs(output - output_new)).item()
@@ -1309,11 +1308,13 @@ def check_metadata_serializable(metadata: dict):
 
     return metadata
 
+
 def check_metadata_serializable_all_types(metadata: dict):
     """
     Ensure metadata is JSON serializable,
     if not, convert non-serializable values to strings recursively
     """
+
     def convert_to_serializable(obj):
         if isinstance(obj, dict):
             return {k: convert_to_serializable(v) for k, v in obj.items()}
@@ -1343,7 +1344,7 @@ def check_metadata_serializable_all_types(metadata: dict):
 
 
 def fetch_baseline_time(
-    level_name: str, problem_id: int, dataset: list[str], baseline_time_filepath: str
+        level_name: str, problem_id: int, dataset: list[str], baseline_time_filepath: str
 ) -> dict:
     """
     Fetch the baseline time from the time
@@ -1385,7 +1386,6 @@ def get_timing_stats(elapsed_times: list[float], device: torch.device = None) ->
         stats["device"] = str(device)  # for debugging
 
     return stats
-
 
 # if __name__ == "__main__":
 # fetch_kernel_from_database("kernelbench_prompt_v2_level_2", 1, 1, "http://localhost:9091")
