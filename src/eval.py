@@ -86,6 +86,8 @@ class KernelExecResult(BaseModel):
     compiled: bool = False
     correctness: bool = False
     metadata: dict = {}
+    org_runtime: float = -1.0
+    org_runtime_stats: dict = {}
     runtime: float = -1.0  # in us, only recorded if we decide to measure performance
     runtime_stats: dict = {}  # only recorded if we decide to measure performance
 
@@ -812,7 +814,7 @@ def eval_triton_kernel_against_ref(
     assert torch.cuda.is_available(), "CUDA is not available, cannot run Triton kernels"
 
     # Verify device is valid
-    if not torch.cuda.is_available():
+    if torch.cuda.current_device():
         raise ValueError(f"Device must be CUDA device, got {device}")
 
     # Check if device is accessible
@@ -1019,9 +1021,27 @@ def eval_triton_kernel_against_ref(
                     x.cuda(device=device) if isinstance(x, torch.Tensor) else x
                     for x in inputs
                 ]
+
+                # evaluate org model
+                org_model = original_model.cuda(device=device)
+                torch.cuda.synchronize(device=device)
+                org_elapsed_times = time_execution_with_cuda_event(
+                    org_model,
+                    *inputs,
+                    num_trials=num_perf_trials,
+                    verbose=verbose,
+                    device=device,
+                )
+                org_runtime_stats = get_timing_stats(org_elapsed_times, device=device)
+
+                if verbose:
+                    print(f"[Eval] Original model Performance Stats: {org_runtime_stats}")
+                kernel_exec_result.org_runtime = org_runtime_stats["mean"]
+                kernel_exec_result.org_runtime_stats = org_runtime_stats
+
+                # evaluate cust model
                 model_new = custom_model.cuda(device=device)
                 torch.cuda.synchronize(device=device)
-
                 elapsed_times = time_execution_with_cuda_event(
                     model_new,
                     *inputs,
