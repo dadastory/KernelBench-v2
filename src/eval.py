@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import traceback
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
 
@@ -874,7 +875,7 @@ def eval_triton_kernel_against_ref(
             f"Failed to compile Triton kernel: Record as compilation failure. \nError: {e}"
         )
         # Categorize and add detailed metadata for compilation errors (Triton-specific)
-        error_str = str(e)
+        error_str = f'Failed to compile Triton kernel: Record as compilation failure. \nError: {str(e)}\nTraceback: {traceback.format_exc()}'
         metadata["compilation_error"] = error_str
 
         # Categorize error types for better debugging
@@ -924,7 +925,7 @@ def eval_triton_kernel_against_ref(
             f"Failed to load Triton kernel; Compiled but not able to run, count as runtime error. \nError: {e}"
         )
         # Categorize and add detailed metadata for runtime errors
-        error_str = str(e)
+        error_str = f"Failed to load Triton kernel; Compiled but not able to run, count as runtime error. \nError: {e}\nTraceback: {traceback.format_exc()}"
         metadata["runtime_error"] = error_str
 
         # Categorize runtime error types for better debugging (Triton-specific)
@@ -976,7 +977,7 @@ def eval_triton_kernel_against_ref(
         )
     except Exception as e:
         # Categorize and add detailed metadata for correctness check errors (Triton-specific)
-        error_str = str(e)
+        error_str = f'Checking Correctness Error: {str(e)}\nTraceback: {traceback.format_exc()}'
         metadata["runtime_error"] = error_str
 
         # Categorize error types during correctness checking
@@ -1277,7 +1278,7 @@ def run_and_check_correctness(
             except Exception as e:
                 print("[Error] Exception happens during correctness check")
                 print(f"Error in launching kernel for ModelNew: {e}")
-
+                error = f"Error in launching kernel for ModelNew: {str(e)}\nTraceback: {traceback.format_exc()}"
                 metadata = register_and_format_exception(
                     "runtime_error", e, metadata, truncate=True
                 )
