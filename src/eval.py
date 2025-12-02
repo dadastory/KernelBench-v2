@@ -1124,8 +1124,8 @@ def register_and_format_exception(
     """
     # Truncate exception message if too long
     exception_str = str(exception_msg)
-    if truncate and len(exception_str) > max_length:
-        exception_str = exception_str[: max_length - 3] + "..."
+    # if truncate and len(exception_str) > max_length:
+    #     exception_str = exception_str[: max_length - 3] + "..."
 
     if verbose:
         print(f"[Exception {exception_type}] {exception_str} ")
