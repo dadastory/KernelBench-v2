@@ -1280,7 +1280,7 @@ def run_and_check_correctness(
                 print(f"Error in launching kernel for ModelNew: {e}")
                 error = f"Error in launching kernel for ModelNew: {str(e)}\nTraceback: {traceback.format_exc()}"
                 metadata = register_and_format_exception(
-                    "runtime_error", e, metadata, truncate=True
+                    "runtime_error", error, metadata, truncate=True
                 )
                 return KernelExecResult(
                     compiled=True, correctness=False, metadata=metadata
