@@ -72,12 +72,12 @@ def fetch_ref_arch_from_level_problem_id(level, problem_id, with_name=False):
     return fetch_ref_arch_from_problem_id(problem_id, dataset, with_name)
 
 
-def set_seed(seed: int, platform: str = 'gpu'):
+def set_seed(seed: int):
     torch.manual_seed(seed)
     # NOTE: this only sets on current cuda device
-    if platform == 'gpu':
+    if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
-    elif platform == 'npu':
+    elif torch.npu.is_available():
         torch.npu.manual_seed(seed)
 
 
@@ -878,14 +878,14 @@ def eval_triton_ascend_kernel_against_ref(
     Model, get_init_inputs, get_inputs = load_original_model_and_inputs(
         original_model_src, context
     )
-    set_seed(seed_num, 'npu')  # set seed for reproducible input
+    set_seed(seed_num)  # set seed for reproducible input
     init_inputs = get_init_inputs()
     init_inputs = [
         x.npu(device=device) if isinstance(x, torch.Tensor) else x for x in init_inputs
     ]
 
     with torch.no_grad():
-        set_seed(seed_num, 'npu')  # set seed for reproducible weights
+        set_seed(seed_num)  # set seed for reproducible weights
         original_model = Model(*init_inputs)
         assert hasattr(original_model, "forward")
         if verbose:
@@ -949,7 +949,7 @@ def eval_triton_ascend_kernel_against_ref(
     # at this point we passed compilation
     try:
         with torch.no_grad():
-            set_seed(seed_num, 'npu')  # set seed for reproducible weights
+            set_seed(seed_num)  # set seed for reproducible weights
             custom_model = ModelNew(*init_inputs)
             assert hasattr(custom_model, "forward")
             torch.npu.synchronize(device=device)
@@ -1051,7 +1051,7 @@ def eval_triton_ascend_kernel_against_ref(
                     print("[Eval] Measuring Performance as Triton kernel is Correct")
 
                 torch.npu.synchronize(device=device)
-                set_seed(seed_num, 'npu')
+                set_seed(seed_num)
                 inputs = get_inputs()
                 inputs = [
                     x.npu(device=device) if isinstance(x, torch.Tensor) else x
@@ -1701,17 +1701,17 @@ def run_and_check_correctness_npu(
             if verbose:
                 print(f"[Eval] Generating Random Input with seed {trial_seed}")
 
-            set_seed(trial_seed, 'npu')
+            set_seed(trial_seed)
             inputs = get_inputs_fn()
             inputs = [
                 x.npu(device=device) if isinstance(x, torch.Tensor) else x
                 for x in inputs
             ]
 
-            set_seed(trial_seed, 'npu')
+            set_seed(trial_seed)
             model = original_model_instance.npu(device=device)
 
-            set_seed(trial_seed, 'npu')
+            set_seed(trial_seed)
             model_new = new_model_instance.npu(device=device)
 
             output = model(*inputs)
