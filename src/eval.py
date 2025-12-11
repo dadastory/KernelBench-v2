@@ -1524,7 +1524,7 @@ def time_execution_with_npu_event(
     """
     if device is None:
         if verbose:
-            print(f"Using current device: {torch.cuda.current_device()}")
+            print(f"Using current device: {torch.npu.current_device()}")
         device = torch.npu.current_device()
 
     # Warm ups
@@ -1533,7 +1533,7 @@ def time_execution_with_npu_event(
         torch.npu.synchronize(device=device)
 
     print(
-        f"[Profiling] Using device: {device} {torch.cuda.get_device_name(device)}, warm up {num_warmup}, trials {num_trials}"
+        f"[Profiling] Using device: {device} {torch.npu.get_device_name(device)}, warm up {num_warmup}, trials {num_trials}"
     )
     elapsed_times = []
 
