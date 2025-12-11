@@ -858,7 +858,7 @@ def eval_triton_ascend_kernel_against_ref(
         torch.npu.set_device(device)
         torch.npu.current_device()
     except Exception as e:
-        raise RuntimeError(f"Cannot access CUDA device {device}: {e}")
+        raise RuntimeError(f"Cannot access NPU device {device}: {e}")
     torch.set_printoptions(
         precision=4,  # Decimal places
         threshold=10,  # Total number of elements before truncating
@@ -1365,6 +1365,7 @@ def eval_triton_kernel_against_ref(
                 kernel_exec_result.runtime = runtime_stats["mean"]
                 kernel_exec_result.runtime_stats = runtime_stats
         except Exception as e:
+            print(traceback.format_exc())
             if verbose:
                 print(f"[Eval] Error in Measuring Performance: {e}")
             kernel_exec_result.metadata["error_during_performance"] = str(e)
@@ -1878,7 +1879,10 @@ def get_timing_stats(elapsed_times: list[float], device: torch.device = None) ->
     }
 
     if device:
-        stats["hardware"] = torch.cuda.get_device_name(device=device)
+        if torch.cuda.is_available():
+            stats["hardware"] = torch.cuda.get_device_name(device=device)
+        elif torch.npu.is_available():
+            stats["hardware"] = torch.npu.get_device_name(device)
         stats["device"] = str(device)  # for debugging
 
     return stats
