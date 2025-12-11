@@ -6,7 +6,6 @@ import json
 import os
 import subprocess
 import sys
-import traceback
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
 
@@ -837,7 +836,7 @@ def eval_triton_ascend_kernel_against_ref(
         verbose: bool = False,
         measure_performance: bool = False,
         build_dir: os.PathLike = None,
-        device: torch.device = torch.npu.current_device() if torch.npu.is_available() else None,
+        device: torch.device = None,
 ) -> KernelExecResult:
     """
     Evaluate Triton kernel against the original model
@@ -849,7 +848,7 @@ def eval_triton_ascend_kernel_against_ref(
     """
     # Check device availability and status
     assert torch.npu.is_available(), "NPU is not available, cannot run Triton Ascend kernels"
-
+    device = torch.npu.current_device() if torch.npu and torch.npu.is_available() else None
     # Verify device is valid
     if torch.npu.current_device():
         raise ValueError(f"Device must be NPU device, got {device}")
