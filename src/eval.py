@@ -73,10 +73,13 @@ def fetch_ref_arch_from_level_problem_id(level, problem_id, with_name=False):
     return fetch_ref_arch_from_problem_id(problem_id, dataset, with_name)
 
 
-def set_seed(seed: int):
+def set_seed(seed: int, platform: str = 'gpu'):
     torch.manual_seed(seed)
     # NOTE: this only sets on current cuda device
-    torch.cuda.manual_seed(seed)
+    if platform == 'gpu':
+        torch.cuda.manual_seed(seed)
+    elif platform == 'npu':
+        torch.npu.manual_seed(seed)
 
 
 class KernelExecResult(BaseModel):
@@ -759,6 +762,39 @@ def eval_kernel_against_ref(
     return kernel_exec_result
 
 
+def graceful_eval_cleanup_triton_ascend(curr_context: dict, device: torch.device):
+    """
+    Clean up env, gpu cache, and Triton cache after evaluation
+    """
+    # Clean up temporary Triton module files if they exist
+    if "_triton_module_path" in curr_context:
+        try:
+            module_path = curr_context["_triton_module_path"]
+            if os.path.exists(module_path):
+                os.unlink(module_path)
+        except Exception:
+            pass  # Ignore cleanup errors
+
+    if "_triton_module_name" in curr_context:
+        try:
+            import sys
+            module_name = curr_context["_triton_module_name"]
+            if module_name in sys.modules:
+                del sys.modules[module_name]
+        except Exception:
+            pass  # Ignore cleanup errors
+
+    del curr_context
+    # Clear CUDA cache and reset GPU state
+    with torch.npu.device(device):
+        torch.npu.empty_cache()
+        torch.npu.reset_peak_memory_stats(device=device)
+        torch.npu.synchronize(device=device)
+
+    # Clean Triton cache
+    _cleanup_triton_cache()
+
+
 def graceful_eval_cleanup_triton(curr_context: dict, device: torch.device):
     """
     Clean up env, gpu cache, and Triton cache after evaluation
@@ -790,6 +826,279 @@ def graceful_eval_cleanup_triton(curr_context: dict, device: torch.device):
 
     # Clean Triton cache
     _cleanup_triton_cache()
+
+
+def eval_triton_ascend_kernel_against_ref(
+        original_model_src: str,
+        custom_model_src: str,
+        seed_num: int = 42,
+        num_correct_trials: int = 1,
+        num_perf_trials: int = 10,
+        verbose: bool = False,
+        measure_performance: bool = False,
+        build_dir: os.PathLike = None,
+        device: torch.device = torch.npu.current_device() if torch.npu.is_available() else None,
+) -> KernelExecResult:
+    """
+    Evaluate Triton kernel against the original model
+    This is the Triton equivalent of eval_kernel_against_ref with the same robustness
+
+    num_correct_trials: number of trials to initialize different random inputs; correctness pass only if all trials pass
+    num_perf_trials: run the evaluation many times to take the average
+    device: NPU device to run the evaluation on
+    """
+    # Check device availability and status
+    assert torch.npu.is_available(), "NPU is not available, cannot run Triton Ascend kernels"
+
+    # Verify device is valid
+    if torch.npu.current_device():
+        raise ValueError(f"Device must be NPU device, got {device}")
+
+    # Check if device is accessible
+    try:
+        torch.npu.set_device(device)
+        torch.npu.current_device()
+    except Exception as e:
+        raise RuntimeError(f"Cannot access CUDA device {device}: {e}")
+    torch.set_printoptions(
+        precision=4,  # Decimal places
+        threshold=10,  # Total number of elements before truncating
+        edgeitems=3,  # Number of elements at beginning and end of dimensions
+        linewidth=80,  # Maximum width before wrapping
+    )
+
+    # set CUDA device
+    torch.npu.set_device(device)
+
+    context = {}
+
+    if verbose:
+        print(f"[Eval] Start Triton Evaluation! on device: {device}")
+        print("[Eval] Loading Original Model")
+
+    Model, get_init_inputs, get_inputs = load_original_model_and_inputs(
+        original_model_src, context
+    )
+    set_seed(seed_num, 'npu')  # set seed for reproducible input
+    init_inputs = get_init_inputs()
+    init_inputs = [
+        x.npu(device=device) if isinstance(x, torch.Tensor) else x for x in init_inputs
+    ]
+
+    with torch.no_grad():
+        set_seed(seed_num, 'npu')  # set seed for reproducible weights
+        original_model = Model(*init_inputs)
+        assert hasattr(original_model, "forward")
+        if verbose:
+            print("[Eval] Original Model Loaded")
+    if verbose:
+        print("[Eval] Loading and Compiling Triton Kernel")
+
+    metadata = {}  # for storing result metadata
+    metadata["hardware"] = torch.npu.get_device_name(device)
+    metadata["device"] = str(device)  # for debugging
+    metadata["kernel_type"] = "triton"
+
+    # this is where compilation happens (matching NPU structure)
+    try:
+        # Set Triton environment variables (equivalent to NPU's TORCH_USE_CUDA_DSA)
+        os.environ["TRITON_PRINT_AUTOTUNING"] = "0"  # reduce noise during eval
+        # add hash for later to distinguish between multi-turn kernels
+        ModelNew = load_custom_model_triton(custom_model_src, context, build_dir)
+        torch.npu.synchronize(device=device)  # not sure if this is too much
+    except Exception as e:
+        print(
+            f"Failed to compile Triton kernel: Record as compilation failure. \nError: {e}"
+        )
+        # Categorize and add detailed metadata for compilation errors (Triton-specific)
+        error_str = str(e)
+        metadata["compilation_error"] = error_str
+
+        # Categorize error types for better debugging
+        if "lock" in error_str.lower() or "no such file or directory" in error_str.lower():
+            metadata["error_category"] = "file_system_error"
+            # this is a lock file error, likely due to concurrent compilation
+            # this does not necessarily mean the compilation failed, but we should retry
+            print(
+                f"[Eval] Lock file or permission error during Triton compilation, Please retry. Error: {e}"
+            )
+            graceful_eval_cleanup_triton_ascend(context, device)
+            return None
+        elif "permission" in error_str.lower():
+            metadata["error_category"] = "permission_error"
+        elif "triton" in error_str.lower():
+            if "not installed" in error_str.lower() or "import" in error_str.lower():
+                metadata["error_category"] = "triton_import_error"
+            elif "jit" in error_str.lower():
+                metadata["error_category"] = "triton_jit_error"
+            else:
+                metadata["error_category"] = "triton_compilation_error"
+        elif "syntax" in error_str.lower():
+            metadata["error_category"] = "syntax_error"
+        elif "import" in error_str.lower():
+            metadata["error_category"] = "import_error"
+        elif "could not get source code" in error_str.lower():
+            metadata["error_category"] = "triton_source_inspection_error"
+        else:
+            metadata["error_category"] = "unknown_compilation_error"
+
+        graceful_eval_cleanup_triton_ascend(context, device)
+        return KernelExecResult(
+            compiled=False, metadata=metadata
+        )  # skip further steps
+
+    # at this point we passed compilation
+    try:
+        with torch.no_grad():
+            set_seed(seed_num, 'npu')  # set seed for reproducible weights
+            custom_model = ModelNew(*init_inputs)
+            assert hasattr(custom_model, "forward")
+            torch.npu.synchronize(device=device)
+        if verbose:
+            print("[Eval] Triton Model Loaded")
+    except RuntimeError as e:
+        print(
+            f"Failed to load Triton kernel; Compiled but not able to run, count as runtime error. \nError: {e}"
+        )
+        # Categorize and add detailed metadata for runtime errors
+        error_str = str(e)
+        metadata["runtime_error"] = error_str
+
+        # Categorize runtime error types for better debugging (Triton-specific)
+        if "triton" in error_str.lower():
+            if "compilation" in error_str.lower():
+                metadata["error_category"] = "triton_jit_compilation_error"
+            elif "autotuning" in error_str.lower():
+                metadata["error_category"] = "triton_autotuning_error"
+            else:
+                metadata["error_category"] = "triton_runtime_error"
+        elif "cuda" in error_str.lower():
+            if "illegal memory access" in error_str.lower():
+                metadata["error_category"] = "cuda_illegal_memory_access"
+            elif "out of memory" in error_str.lower():
+                metadata["error_category"] = "cuda_out_of_memory"
+            elif "invalid device" in error_str.lower():
+                metadata["error_category"] = "cuda_invalid_device"
+            else:
+                metadata["error_category"] = "cuda_runtime_error"
+        elif "kernel" in error_str.lower():
+            metadata["error_category"] = "kernel_launch_error"
+        elif "dimension" in error_str.lower() or "shape" in error_str.lower():
+            metadata["error_category"] = "tensor_dimension_error"
+        elif "could not get source code" in error_str.lower():
+            metadata["error_category"] = "triton_source_inspection_error"
+        else:
+            metadata["error_category"] = "unknown_runtime_error"
+
+        graceful_eval_cleanup_triton_ascend(context, device)
+        return KernelExecResult(
+            compiled=True, correctness=False, metadata=metadata
+        )  # skip further steps
+
+    kernel_exec_result = None
+
+    # Check Correctness
+    if verbose:
+        print("[Eval] Checking Correctness")
+    try:
+        kernel_exec_result = run_and_check_correctness_npu(
+            original_model,
+            custom_model,
+            get_inputs,
+            metadata=metadata,
+            num_correct_trials=num_correct_trials,
+            verbose=verbose,
+            seed=seed_num,
+            device=device,
+        )
+    except Exception as e:
+        # Categorize and add detailed metadata for correctness check errors (Triton-specific)
+        error_str = str(e)
+        metadata["runtime_error"] = error_str
+
+        # Categorize error types during correctness checking
+        if "triton" in error_str.lower():
+            if "compilation" in error_str.lower():
+                metadata["error_category"] = "triton_jit_compilation_error"
+            elif "autotuning" in error_str.lower():
+                metadata["error_category"] = "triton_autotuning_error"
+            else:
+                metadata["error_category"] = "triton_runtime_error"
+        elif "cuda" in error_str.lower():
+            if "illegal memory access" in error_str.lower():
+                metadata["error_category"] = "cuda_illegal_memory_access"
+            elif "out of memory" in error_str.lower():
+                metadata["error_category"] = "cuda_out_of_memory"
+            else:
+                metadata["error_category"] = "cuda_runtime_error"
+        elif "kernel" in error_str.lower():
+            metadata["error_category"] = "kernel_launch_error"
+        elif "dimension" in error_str.lower() or "shape" in error_str.lower():
+            metadata["error_category"] = "tensor_dimension_error"
+        elif "could not get source code" in error_str.lower():
+            metadata["error_category"] = "triton_source_inspection_error"
+        else:
+            metadata["error_category"] = "correctness_check_error"
+
+        kernel_exec_result = KernelExecResult(
+            compiled=True, correctness=False, metadata=metadata
+        )
+
+    # Measure Performance [Optional] | conditioned on compilation + correctness + no exception so far
+    if measure_performance:
+        try:
+            if kernel_exec_result and kernel_exec_result.correctness:
+                if verbose:
+                    print("[Eval] Measuring Performance as Triton kernel is Correct")
+
+                torch.npu.synchronize(device=device)
+                set_seed(seed_num, 'npu')
+                inputs = get_inputs()
+                inputs = [
+                    x.npu(device=device) if isinstance(x, torch.Tensor) else x
+                    for x in inputs
+                ]
+
+                # evaluate org model
+                org_model = original_model.cuda(device=device)
+                torch.npu.synchronize(device=device)
+                org_elapsed_times = time_execution_with_npu_event(
+                    org_model,
+                    *inputs,
+                    num_trials=num_perf_trials,
+                    verbose=verbose,
+                    device=device,
+                )
+                org_runtime_stats = get_timing_stats(org_elapsed_times, device=device)
+
+                if verbose:
+                    print(f"[Eval] Original model Performance Stats: {org_runtime_stats}")
+                kernel_exec_result.org_runtime = org_runtime_stats["mean"]
+                kernel_exec_result.org_runtime_stats = org_runtime_stats
+
+                # evaluate cust model
+                model_new = custom_model.npu(device=device)
+                torch.npu.synchronize(device=device)
+                elapsed_times = time_execution_with_npu_event(
+                    model_new,
+                    *inputs,
+                    num_trials=num_perf_trials,
+                    verbose=verbose,
+                    device=device,
+                )
+                runtime_stats = get_timing_stats(elapsed_times, device=device)
+
+                if verbose:
+                    print(f"[Eval] Performance Stats: {runtime_stats}")
+                kernel_exec_result.runtime = runtime_stats["mean"]
+                kernel_exec_result.runtime_stats = runtime_stats
+        except Exception as e:
+            if verbose:
+                print(f"[Eval] Error in Measuring Performance: {e}")
+            kernel_exec_result.metadata["error_during_performance"] = str(e)
+
+    graceful_eval_cleanup_triton_ascend(context, device)
+    return kernel_exec_result
 
 
 def eval_triton_kernel_against_ref(
@@ -1192,6 +1501,64 @@ def time_execution_with_cuda_event(
     return elapsed_times
 
 
+def time_execution_with_npu_event(
+        kernel_fn: callable,
+        *args,
+        num_warmup: int = 3,
+        num_trials: int = 10,
+        verbose: bool = True,
+        device: torch.device = None,
+) -> list[float]:
+    """
+    Time a CUDA kernel function over multiple trials using torch.cuda.Event
+
+    Args:
+        kernel_fn: Function to time
+        *args: Arguments to pass to kernel_fn
+        num_trials: Number of timing trials to run
+        verbose: Whether to print per-trial timing info
+        device: CUDA device to use, if None, use current device
+
+    Returns:
+        List of elapsed times in milliseconds
+    """
+    if device is None:
+        if verbose:
+            print(f"Using current device: {torch.cuda.current_device()}")
+        device = torch.npu.current_device()
+
+    # Warm ups
+    for _ in range(num_warmup):
+        kernel_fn(*args)
+        torch.npu.synchronize(device=device)
+
+    print(
+        f"[Profiling] Using device: {device} {torch.cuda.get_device_name(device)}, warm up {num_warmup}, trials {num_trials}"
+    )
+    elapsed_times = []
+
+    # Actual trials
+    for trial in range(num_trials):
+        # create event marker default is not interprocess
+        start_event = torch.npu.Event(enable_timing=True)
+        end_event = torch.npu.Event(enable_timing=True)
+
+        start_event.record()
+        kernel_fn(*args)
+        end_event.record()
+
+        # Synchronize to ensure the events have completed
+        torch.npu.synchronize(device=device)
+
+        # Calculate the elapsed time in milliseconds
+        elapsed_time_ms = start_event.elapsed_time(end_event)
+        if verbose:
+            print(f"Trial {trial + 1}: {elapsed_time_ms:.3g} ms")
+        elapsed_times.append(elapsed_time_ms)
+
+    return elapsed_times
+
+
 def run_and_check_correctness(
         original_model_instance: nn.Module,
         new_model_instance: nn.Module,
@@ -1245,6 +1612,115 @@ def run_and_check_correctness(
             try:
                 output_new = model_new(*inputs)
                 torch.cuda.synchronize(device=device)
+                if output.shape != output_new.shape:
+                    metadata = register_and_format_exception(
+                        "correctness_issue",
+                        f"Output shape mismatch: Expected {output.shape}, got {output_new.shape}",
+                        metadata,
+                    )
+                    if verbose:
+                        print(
+                            f"[FAIL] trial {trial}: Output shape mismatch: Expected {output.shape}, got {output_new.shape}"
+                        )
+                    return KernelExecResult(
+                        compiled=True, correctness=False, metadata=metadata
+                    )
+
+                # check output value difference
+                if not torch.allclose(
+                        output, output_new, atol=1e-02, rtol=1e-02
+                ):  # fail
+                    max_diff = torch.max(torch.abs(output - output_new)).item()
+                    avg_diff = torch.mean(torch.abs(output - output_new)).item()
+                    metadata.setdefault("max_difference", []).append(f"{max_diff:.6f}")
+                    metadata.setdefault("avg_difference", []).append(f"{avg_diff:.6f}")
+                    metadata["correctness_issue"] = "Output mismatch"
+                    if verbose:
+                        print(f"[FAIL] trial {trial}: Output mismatch")
+                else:  # pass
+                    pass_count += 1
+                    if verbose:
+                        print(f"[PASS] trial {trial}: New Model matches Model")
+
+            except Exception as e:
+                print("[Error] Exception happens during correctness check")
+                print(f"Error in launching kernel for ModelNew: {e}")
+
+                metadata = register_and_format_exception(
+                    "runtime_error", e, metadata, truncate=True
+                )
+                return KernelExecResult(
+                    compiled=True, correctness=False, metadata=metadata
+                )
+                # break
+
+    if verbose:
+        print(
+            f"[Eval] Pass count: {pass_count}, num_correct_trials: {num_correct_trials}"
+        )
+
+    # put all the useful info here!
+    metadata["correctness_trials"] = f"({pass_count} / {num_correct_trials})"
+
+    if pass_count == num_correct_trials:
+        return KernelExecResult(compiled=True, correctness=True, metadata=metadata)
+    else:
+        return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
+
+
+def run_and_check_correctness_npu(
+        original_model_instance: nn.Module,
+        new_model_instance: nn.Module,
+        get_inputs_fn: callable,
+        metadata: dict,
+        num_correct_trials: int,
+        verbose=False,
+        seed=42,
+        device=None,
+) -> KernelExecResult:
+    """
+    run the model and check correctness,
+    assume model already loaded and compiled (loaded and compiled in the caller)
+    this is all on GPU, requiring cuda device and transfer .cuda()
+
+    num_correct_trials: run the evalutation multiple times with (ideally) different random inputs to ensure correctness
+    """
+    pass_count = 0
+
+    # Generate num_correct_trials seeds deterministically from the initial seed
+    torch.manual_seed(seed)
+    correctness_trial_seeds = [
+        torch.randint(0, 2 ** 32 - 1, (1,)).item() for _ in range(num_correct_trials)
+    ]
+
+    with torch.no_grad():
+
+        for trial in range(num_correct_trials):
+
+            trial_seed = correctness_trial_seeds[trial]
+            if verbose:
+                print(f"[Eval] Generating Random Input with seed {trial_seed}")
+
+            set_seed(trial_seed, 'npu')
+            inputs = get_inputs_fn()
+            inputs = [
+                x.npu(device=device) if isinstance(x, torch.Tensor) else x
+                for x in inputs
+            ]
+
+            set_seed(trial_seed, 'npu')
+            model = original_model_instance.npu(device=device)
+
+            set_seed(trial_seed, 'npu')
+            model_new = new_model_instance.npu(device=device)
+
+            output = model(*inputs)
+            torch.npu.synchronize(device=device)
+            # ensure all GPU operations are completed before checking results
+
+            try:
+                output_new = model_new(*inputs)
+                torch.npu.synchronize(device=device)
                 if output.shape != output_new.shape:
                     metadata = register_and_format_exception(
                         "correctness_issue",
