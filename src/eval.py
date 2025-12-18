@@ -1059,7 +1059,7 @@ def eval_triton_ascend_kernel_against_ref(
                 ]
 
                 # evaluate org model
-                org_model = original_model.cuda(device=device)
+                org_model = original_model.npu(device=device)
                 torch.npu.synchronize(device=device)
                 org_elapsed_times = time_execution_with_npu_event(
                     org_model,
