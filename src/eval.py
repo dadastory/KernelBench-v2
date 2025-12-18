@@ -1061,7 +1061,7 @@ def eval_triton_ascend_kernel_against_ref(
                 # evaluate org model
                 org_model = original_model.npu(device=device)
                 torch.npu.synchronize(device=device)
-                org_avg_times = do_bench_npu(org_model, warmup=5, active=num_correct_trials) * 1000
+                org_avg_times = do_bench_npu(lambda: org_model(*inputs), warmup=5, active=num_correct_trials) * 1000
 
                 if verbose:
                     print(f"[Eval] Original model Performance Stats: {org_avg_times}")
@@ -1071,7 +1071,7 @@ def eval_triton_ascend_kernel_against_ref(
                 model_new = custom_model.npu(device=device)
                 torch.npu.synchronize(device=device)
 
-                avg_times = do_bench_npu(model_new, warmup=5, active=num_correct_trials) * 1000
+                avg_times = do_bench_npu(lambda: model_new(*inputs), warmup=5, active=num_correct_trials) * 1000
                 if verbose:
                     print(f"[Eval] Performance Stats: {avg_times}")
                 kernel_exec_result.runtime = avg_times
