@@ -1050,6 +1050,7 @@ def eval_triton_ascend_kernel_against_ref(
                 if verbose:
                     print("[Eval] Measuring Performance as Triton kernel is Correct")
                 from triton.testing import do_bench_npu
+                os.environ['TRITON_BENCH_METHOD'] = ("npu")
                 torch.npu.synchronize(device=device)
                 set_seed(seed_num)
                 inputs = get_inputs()
