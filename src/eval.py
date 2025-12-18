@@ -1049,7 +1049,7 @@ def eval_triton_ascend_kernel_against_ref(
             if kernel_exec_result and kernel_exec_result.correctness:
                 if verbose:
                     print("[Eval] Measuring Performance as Triton kernel is Correct")
-
+                from triton.testing import do_bench_npu
                 torch.npu.synchronize(device=device)
                 set_seed(seed_num)
                 inputs = get_inputs()
@@ -1061,36 +1061,20 @@ def eval_triton_ascend_kernel_against_ref(
                 # evaluate org model
                 org_model = original_model.npu(device=device)
                 torch.npu.synchronize(device=device)
-                org_elapsed_times = time_execution_with_npu_event(
-                    org_model,
-                    *inputs,
-                    num_trials=num_perf_trials,
-                    verbose=verbose,
-                    device=device,
-                )
-                org_runtime_stats = get_timing_stats(org_elapsed_times, device=device)
+                org_avg_times = do_bench_npu(org_model, warmup=5, active=num_correct_trials) * 1000
 
                 if verbose:
-                    print(f"[Eval] Original model Performance Stats: {org_runtime_stats}")
-                kernel_exec_result.org_runtime = org_runtime_stats["mean"]
-                kernel_exec_result.org_runtime_stats = org_runtime_stats
+                    print(f"[Eval] Original model Performance Stats: {org_avg_times}")
+                kernel_exec_result.org_runtime = org_avg_times
 
                 # evaluate cust model
                 model_new = custom_model.npu(device=device)
                 torch.npu.synchronize(device=device)
-                elapsed_times = time_execution_with_npu_event(
-                    model_new,
-                    *inputs,
-                    num_trials=num_perf_trials,
-                    verbose=verbose,
-                    device=device,
-                )
-                runtime_stats = get_timing_stats(elapsed_times, device=device)
 
+                avg_times = do_bench_npu(model_new, warmup=5, active=num_correct_trials) * 1000
                 if verbose:
-                    print(f"[Eval] Performance Stats: {runtime_stats}")
-                kernel_exec_result.runtime = runtime_stats["mean"]
-                kernel_exec_result.runtime_stats = runtime_stats
+                    print(f"[Eval] Performance Stats: {avg_times}")
+                kernel_exec_result.runtime = avg_times
         except Exception as e:
             if verbose:
                 print(f"[Eval] Error in Measuring Performance: {e}")
@@ -1501,64 +1485,6 @@ def time_execution_with_cuda_event(
     return elapsed_times
 
 
-def time_execution_with_npu_event(
-        kernel_fn: callable,
-        *args,
-        num_warmup: int = 3,
-        num_trials: int = 10,
-        verbose: bool = True,
-        device: torch.device = None,
-) -> list[float]:
-    """
-    Time a CUDA kernel function over multiple trials using torch.cuda.Event
-
-    Args:
-        kernel_fn: Function to time
-        *args: Arguments to pass to kernel_fn
-        num_trials: Number of timing trials to run
-        verbose: Whether to print per-trial timing info
-        device: CUDA device to use, if None, use current device
-
-    Returns:
-        List of elapsed times in milliseconds
-    """
-    if device is None:
-        if verbose:
-            print(f"Using current device: {torch.npu.current_device()}")
-        device = torch.npu.current_device()
-
-    # Warm ups
-    for _ in range(num_warmup):
-        kernel_fn(*args)
-        torch.npu.synchronize(device=device)
-
-    print(
-        f"[Profiling] Using device: {device} {torch.npu.get_device_name(device)}, warm up {num_warmup}, trials {num_trials}"
-    )
-    elapsed_times = []
-
-    # Actual trials
-    for trial in range(num_trials):
-        # create event marker default is not interprocess
-        start_event = torch.npu.Event(enable_timing=True)
-        end_event = torch.npu.Event(enable_timing=True)
-
-        start_event.record()
-        kernel_fn(*args)
-        end_event.record()
-
-        # Synchronize to ensure the events have completed
-        torch.npu.synchronize(device=device)
-
-        # Calculate the elapsed time in milliseconds
-        elapsed_time_ms = start_event.elapsed_time(end_event)
-        if verbose:
-            print(f"Trial {trial + 1}: {elapsed_time_ms:.3g} ms")
-        elapsed_times.append(elapsed_time_ms)
-
-    return elapsed_times
-
-
 def run_and_check_correctness(
         original_model_instance: nn.Module,
         new_model_instance: nn.Module,
@@ -1879,10 +1805,7 @@ def get_timing_stats(elapsed_times: list[float], device: torch.device = None) ->
     }
 
     if device:
-        if torch.cuda.is_available():
-            stats["hardware"] = torch.cuda.get_device_name(device=device)
-        elif torch.npu.is_available():
-            stats["hardware"] = torch.npu.get_device_name(device)
+        stats["hardware"] = torch.cuda.get_device_name(device=device)
         stats["device"] = str(device)  # for debugging
 
     return stats
