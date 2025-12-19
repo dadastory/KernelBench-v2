@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import traceback
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
 
@@ -1057,24 +1058,25 @@ def eval_triton_ascend_kernel_against_ref(
                     x.npu(device=device) if isinstance(x, torch.Tensor) else x
                     for x in inputs
                 ]
+                print(f"Start Original model Performance")
+                # evaluate org model
+                org_model = original_model.cuda(device=device)
+                torch.npu.synchronize(device=device)
+                org_elapsed_times = time_execution_with_npu_event(
+                    org_model,
+                    *inputs,
+                    num_trials=num_perf_trials,
+                    verbose=verbose,
+                    device=device,
+                )
+                org_runtime_stats = get_timing_stats(org_elapsed_times, device=device)
 
-                # # evaluate org model
-                # org_model = original_model.cuda(device=device)
-                # torch.npu.synchronize(device=device)
-                # org_elapsed_times = time_execution_with_npu_event(
-                #     org_model,
-                #     *inputs,
-                #     num_trials=num_perf_trials,
-                #     verbose=verbose,
-                #     device=device,
-                # )
-                # org_runtime_stats = get_timing_stats(org_elapsed_times, device=device)
-                #
-                # if verbose:
-                #     print(f"[Eval] Original model Performance Stats: {org_runtime_stats}")
-                # kernel_exec_result.org_runtime = org_runtime_stats["mean"]
-                # kernel_exec_result.org_runtime_stats = org_runtime_stats
+                if verbose:
+                    print(f"[Eval] Original model Performance Stats: {org_runtime_stats}")
+                kernel_exec_result.org_runtime = org_runtime_stats["mean"]
+                kernel_exec_result.org_runtime_stats = org_runtime_stats
 
+                print(f"Start Custom model Performance")
                 # evaluate cust model
                 model_new = custom_model.npu(device=device)
                 torch.npu.synchronize(device=device)
